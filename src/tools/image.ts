@@ -6,6 +6,8 @@ import { checkBudget, recordSpending } from "../utils/budget.js";
 import { formatError } from "../utils/errors.js";
 import type { BudgetState } from "../types.js";
 import { getChain, getImageClient } from "../utils/wallet.js";
+import { shouldInline, buildInlineImageBlock } from "../utils/inline-image.js";
+import { confirmSpend } from "../utils/confirm-spend.js";
 
 // Base (1024x1024) prices, mirroring the live /v1/images/models catalog.
 // dall-e-3 and flux-schnell were delisted upstream — do not re-add them.
@@ -79,10 +81,11 @@ Edit (img2img) models: openai/gpt-image-2 (default), openai/gpt-image-1, google/
         image: z.string().optional().describe("Source image for edit action: base64-encoded image or URL"),
         size: z.string().optional().default("1024x1024").describe("Image size. Common values: 1024x1024 (all models), 1536x1024 / 1024x1536 (gpt-image-*), 2048x2048 / 4096x4096 (nano-banana-pro)"),
         quality: z.enum(["standard", "hd"]).optional().default("standard"),
+        inline: z.boolean().optional().describe("Return a small inline image preview (thumbnail) the client can render in-conversation, in addition to the full-resolution URL. Defaults to the BLOCKRUN_INLINE_IMAGES env setting (off unless set). Rich clients (e.g. the VS Code extension) render it; plain terminals ignore it. Off keeps responses lightweight."),
         agent_id: z.string().optional().describe("Agent identifier for budget tracking and enforcement."),
       },
     },
-    async ({ prompt, action, model, image, size, quality, agent_id }) => {
+    async ({ prompt, action, model, image, size, quality, inline, agent_id }) => {
       try {
         if (getChain() !== "base") {
           return {
@@ -92,8 +95,8 @@ Edit (img2img) models: openai/gpt-image-2 (default), openai/gpt-image-1, google/
         }
 
         const selectedModel = model || "openai/gpt-image-2";
-        let response;
 
+        // Validate the edit action up front (before estimating/charging).
         if (action === "edit") {
           if (!image) {
             return {
@@ -107,35 +110,32 @@ Edit (img2img) models: openai/gpt-image-2 (default), openai/gpt-image-1, google/
               isError: true,
             };
           }
-          const estimatedCost = estimateCost(selectedModel, size);
-          const budgetCheck = checkBudget(budget, agent_id, estimatedCost);
-          if (!budgetCheck.allowed) {
-            return {
-              content: [{ type: "text", text: `${budgetCheck.reason}. Use blockrun_wallet action:"report" to see usage or action:"delegate" to increase agent budget.` }],
-              isError: true,
-            };
-          }
-          response = await getImageClient().edit(prompt, image, {
-            model: selectedModel,
-            size,
-          });
-          recordSpending(budget, estimatedCost, agent_id);
-        } else {
-          const estimatedCost = estimateCost(selectedModel, size);
-          const budgetCheck = checkBudget(budget, agent_id, estimatedCost);
-          if (!budgetCheck.allowed) {
-            return {
-              content: [{ type: "text", text: `${budgetCheck.reason}. Use blockrun_wallet action:"report" to see usage or action:"delegate" to increase agent budget.` }],
-              isError: true,
-            };
-          }
-          response = await getImageClient().generate(prompt, {
-            model: selectedModel,
-            size,
-            quality: quality as "standard" | "hd",
-          });
-          recordSpending(budget, estimatedCost, agent_id);
         }
+
+        const estimatedCost = estimateCost(selectedModel, size);
+        const budgetCheck = checkBudget(budget, agent_id, estimatedCost);
+        if (!budgetCheck.allowed) {
+          return {
+            content: [{ type: "text", text: `${budgetCheck.reason}. Use blockrun_wallet action:"report" to see usage or action:"delegate" to increase agent budget.` }],
+            isError: true,
+          };
+        }
+
+        // Confirm the spend before charging (elicitation; user can approve once,
+        // approve all for the session, or cancel). No-ops on clients without
+        // elicitation or when disabled via env.
+        const confirm = await confirmSpend(server, {
+          usd: estimatedCost,
+          label: `${action === "edit" ? "image edit" : "image"} · ${selectedModel}`,
+        });
+        if (!confirm.ok) {
+          return { content: [{ type: "text", text: confirm.reason || "Charge cancelled." }] };
+        }
+
+        const response = action === "edit"
+          ? await getImageClient().edit(prompt, image as string, { model: selectedModel, size })
+          : await getImageClient().generate(prompt, { model: selectedModel, size, quality: quality as "standard" | "hd" });
+        recordSpending(budget, estimatedCost, agent_id);
 
         const imageUrl = response.data?.[0]?.url;
 
@@ -146,9 +146,14 @@ Edit (img2img) models: openai/gpt-image-2 (default), openai/gpt-image-1, google/
           };
         }
 
+        const textBlock = { type: "text" as const, text: `Image: ${imageUrl}\nPrompt: ${prompt}\nModel: ${selectedModel}` };
+        // Optional inline preview (thumbnail) for rich clients. Best-effort:
+        // on failure or if disabled, fall back to the URL-only text block.
+        const previewBlock = shouldInline(inline) ? await buildInlineImageBlock(imageUrl) : null;
+
         return {
-          content: [{ type: "text", text: `Image: ${imageUrl}\nPrompt: ${prompt}\nModel: ${selectedModel}` }],
-          structuredContent: { url: imageUrl, prompt, model: selectedModel },
+          content: previewBlock ? [previewBlock, textBlock] : [textBlock],
+          structuredContent: { url: imageUrl, prompt, model: selectedModel, inlined: Boolean(previewBlock) },
         };
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
